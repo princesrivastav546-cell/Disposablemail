@@ -648,9 +648,21 @@ def main():
     if not bot_token:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var")
 
+    # Start Render port server
     threading.Thread(target=run_port_server, daemon=True).start()
 
     app = Application.builder().token(bot_token).build()
     app.add_handler(MessageHandler(filters.TEXT | filters.COMMAND, handle_text))
 
-    app.job_queue.run_repeating(poll_all_chats, interval=P
+    # Auto-forward emails
+    app.job_queue.run_repeating(
+        poll_all_chats,
+        interval=POLL_EVERY_SECONDS,
+        first=5
+    )
+
+    app.run_polling(close_loop=False)
+
+
+if __name__ == "__main__":
+    main()
