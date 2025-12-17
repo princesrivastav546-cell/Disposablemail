@@ -7,6 +7,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional, List, Tuple
 
 import httpx
+from bs4 import BeautifulSoup
+import html as html_lib
+
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.constants import ParseMode
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
@@ -23,7 +26,7 @@ POLL_EVERY_SECONDS = int(os.environ.get("POLL_EVERY_SECONDS", "12"))
 CONTACT_USERNAME = "@platoonleaderr"
 
 # =========================
-# BUTTONS (NO COMMANDS)
+# BUTTONS
 # =========================
 BTN_NEW = "📧 Generate new mail"
 BTN_DELETE = "🗑️ Delete current mail"
@@ -55,7 +58,7 @@ def init_db() -> None:
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
 
-    # mailboxes table (per user sequence via user_seq)
+    # mailboxes with per-user sequence user_seq
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS mailboxes (
@@ -72,10 +75,9 @@ def init_db() -> None:
         """
     )
 
-    # migrate older db (if your old table didn't have user_seq)
+    # migrate old DB (if previous table lacked user_seq)
     try:
         cur.execute("ALTER TABLE mailboxes ADD COLUMN user_seq INTEGER")
-        # After adding column, existing rows will have NULL; we'll backfill below.
     except Exception:
         pass
 
@@ -90,7 +92,7 @@ def init_db() -> None:
         """
     )
 
-    # seen messages
+    # seen messages (avoid duplicates)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS seen_messages (
@@ -102,8 +104,7 @@ def init_db() -> None:
         """
     )
 
-    # Backfill user_seq for any rows where user_seq is NULL (for old DBs)
-    # Assign per-user sequence ordered by created_at, id.
+    # Backfill user_seq for older rows where user_seq is NULL
     cur.execute("SELECT DISTINCT chat_id FROM mailboxes")
     chat_ids = [r[0] for r in cur.fetchall()]
     for cid in chat_ids:
@@ -116,12 +117,8 @@ def init_db() -> None:
         for row_id, user_seq in rows:
             if user_seq is None:
                 seq += 1
-                cur.execute(
-                    "UPDATE mailboxes SET user_seq=? WHERE id=?",
-                    (seq, row_id),
-                )
+                cur.execute("UPDATE mailboxes SET user_seq=? WHERE id=?", (seq, row_id))
             else:
-                # keep existing, but ensure seq moves forward
                 try:
                     seq = max(seq, int(user_seq))
                 except Exception:
@@ -132,11 +129,7 @@ def init_db() -> None:
 
 
 def db_save_mailbox(chat_id: int, address: str, password: str, token: str) -> int:
-    """
-    Saves mailbox and assigns a per-user sequence number (user_seq)
-    so each user sees IDs: 1,2,3... (not global)
-    Returns internal DB primary key id (mailbox_id)
-    """
+    """Assign per-user sequence (user_seq): 1,2,3... for each user"""
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
 
@@ -159,10 +152,7 @@ def db_save_mailbox(chat_id: int, address: str, password: str, token: str) -> in
 
 
 def db_list_mailboxes(chat_id: int) -> List[Tuple[int, int, str, int]]:
-    """
-    Returns:
-      [(db_id, user_seq, address, created_at), ...]
-    """
+    """[(db_id, user_seq, address, created_at), ...]"""
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute(
@@ -175,10 +165,7 @@ def db_list_mailboxes(chat_id: int) -> List[Tuple[int, int, str, int]]:
 
 
 def db_get_mailbox_by_seq(chat_id: int, user_seq: int) -> Optional[Tuple[int, str]]:
-    """
-    Lookup mailbox by per-user ID (user_seq)
-    Returns (db_id, address) or None
-    """
+    """(db_id, address) or None"""
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute(
@@ -208,9 +195,7 @@ def db_set_active_mailbox(chat_id: int, mailbox_id: int) -> None:
 
 
 def db_get_active_mailbox(chat_id: int) -> Optional[Tuple[int, str, str]]:
-    """
-    returns (mailbox_db_id, address, token)
-    """
+    """(mailbox_db_id, address, token)"""
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute(
@@ -228,9 +213,7 @@ def db_get_active_mailbox(chat_id: int) -> Optional[Tuple[int, str, str]]:
 
 
 def db_delete_active_mailbox_only(chat_id: int) -> None:
-    """
-    Removes active selection only; saved mails remain for reuse
-    """
+    """Remove only active selection; saved list remains"""
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("DELETE FROM active_mailbox WHERE chat_id=?", (chat_id,))
@@ -320,14 +303,37 @@ async def mailtm_read_message(client: httpx.AsyncClient, token: str, msg_id: str
     return r.json()
 
 
+# =========================
+# HTML -> TEXT (Fix for HTML-only emails)
+# =========================
+def html_to_text(html_content) -> str:
+    if isinstance(html_content, list):
+        html_content = "\n".join([x for x in html_content if isinstance(x, str)])
+    if not isinstance(html_content, str):
+        return ""
+
+    html_content = html_lib.unescape(html_content)
+    soup = BeautifulSoup(html_content, "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    text = soup.get_text(separator="\n")
+    lines = [ln.strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln]
+    return "\n".join(lines)
+
+
 def format_full_message(msg: dict) -> str:
     frm = (msg.get("from") or {}).get("address", "unknown")
     subj = msg.get("subject") or "(no subject)"
     created = msg.get("createdAt") or ""
 
     text = (msg.get("text") or "").strip()
-    if not text and msg.get("html"):
-        text = "(HTML-only email. Text version not available.)"
+    if not text:
+        text = html_to_text(msg.get("html"))
+
+    if not text:
+        text = "(empty body)"
 
     if len(text) > 3500:
         text = text[:3500] + "\n…(truncated)"
@@ -337,7 +343,7 @@ def format_full_message(msg: dict) -> str:
         f"<b>From:</b> {frm}\n"
         f"<b>Subject:</b> {subj}\n"
         f"<b>Date:</b> {created}\n\n"
-        f"{text or '(empty body)'}"
+        f"{text}"
     )
 
 
@@ -350,7 +356,7 @@ async def create_new_mail_for_chat(chat_id: int) -> str:
 
 
 # =========================
-# TELEGRAM HANDLER
+# TELEGRAM UI HANDLER
 # =========================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
@@ -403,6 +409,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         for db_id, user_seq, addr, _created_at in rows[:30]:
             mark = "✅" if db_id == active_db_id else "▫️"
             lines.append(f"{mark} <code>{addr}</code>\n<b>ID:</b> <code>{user_seq}</code>\n")
+
         lines.append("To reuse: tap “♻️ Reuse a mail”, then send the ID.")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
         return
@@ -515,7 +522,6 @@ def main():
     if not bot_token:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var")
 
-    # Start server so Render sees an open port
     threading.Thread(target=run_port_server, daemon=True).start()
 
     app = Application.builder().token(bot_token).build()
