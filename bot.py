@@ -628,12 +628,16 @@ async def poll_all_chats(context: ContextTypes.DEFAULT_TYPE) -> None:
 # RENDER PORT SERVER
 # =========================
 class Handler(BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
         self.wfile.write(b"OK")
-
 
 def run_port_server():
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
